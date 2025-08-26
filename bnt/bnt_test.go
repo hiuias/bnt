@@ -1,4 +1,4 @@
-package binarytoken
+package bnt
 
 import (
 	"crypto/rand"
@@ -7,6 +7,32 @@ import (
 	"testing"
 	"time"
 )
+
+// 示例：自定义Claims
+type UserClaims struct {
+	UserID   string `json:"user_id"`
+	Username string `json:"username"`
+	RegisteredClaims
+}
+
+// Valid 验证自定义claims
+func (uc *UserClaims) Valid() error {
+	// 先验证标准声明
+	if err := uc.RegisteredClaims.Valid(); err != nil {
+		return err
+	}
+
+	// 验证自定义字段
+	if uc.UserID == "" {
+		return ErrTokenRequiredClaimMissing
+	}
+
+	if uc.Username == "" {
+		return ErrTokenRequiredClaimMissing
+	}
+
+	return nil
+}
 
 // 生成测试用的密钥对
 func generateTestKeys(t *testing.T) (aesKey, hmacKey []byte) {

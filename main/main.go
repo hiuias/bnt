@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hiuias/bnt/bnt"
 	"time"
-	"token/binarytoken"
 )
 
 // 生成测试用的密钥对
 func generateTestKeys() (aesKey, hmacKey []byte) {
-	aesKey = make([]byte, binarytoken.AESKeyLen)
+	aesKey = make([]byte, bnt.AESKeyLen)
 	if _, err := rand.Read(aesKey); err != nil {
 		fmt.Println(err)
 	}
@@ -23,49 +23,6 @@ func generateTestKeys() (aesKey, hmacKey []byte) {
 	}
 
 	return aesKey, hmacKey
-}
-
-type UserInfo struct {
-	User struct {
-		Domain struct {
-			Id   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"domain"`
-		ID   string `json:"id"`
-		Name struct {
-			Account string `json:"account"`
-		} `json:"name"`
-	} `json:"user"`
-}
-
-// 示例：自定义Claims
-type UserClaims struct {
-	UserInfo *UserInfo `json:"user_info"`
-	binarytoken.RegisteredClaims
-}
-
-// 创建测试用的claims
-func createTestClaims() *UserClaims {
-	now := time.Now().UTC()
-	expiresAt := now.Add(-1 * time.Hour)
-	notBefore := now.Add(-2 * time.Hour)
-	s := &UserInfo{}
-	s.User.Domain.Id = "5dbc59fd33e94b70a60d9b55633f53d2"
-	s.User.Domain.Name = "sys_svc_snms"
-	s.User.ID = "5dbc59fd33e94b70a60d9b55633f53d2"
-	s.User.Name.Account = "sys_svc_snms"
-	return &UserClaims{
-		UserInfo: s,
-		RegisteredClaims: binarytoken.RegisteredClaims{
-			Issuer:    "test_issuer",
-			Subject:   "test_subject",
-			Audience:  []string{"sys_svc_snms", "sys_svc_snms"},
-			ExpiresAt: &expiresAt, // 过期时间
-			NotBefore: &notBefore, // 生效时间
-			IssuedAt:  &now,       // 签发时间
-			ID:        "test_jti_d0fdd71e67f24c938f956f4b4522c208",
-		},
-	}
 }
 
 // 示例：从环境变量获取密钥
@@ -97,6 +54,48 @@ func GetKeysFromEnv() (aesKey, hmacKey []byte, err error) {
 	return aesKey, hmacKey, nil
 }
 
+type UserInfo struct {
+	User struct {
+		Domain struct {
+			Id   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"domain"`
+		ID   string `json:"id"`
+		Name struct {
+			Account string `json:"account"`
+		} `json:"name"`
+	} `json:"user"`
+}
+
+// 示例：自定义Claims
+type UserClaims struct {
+	UserInfo *UserInfo `json:"user_info"`
+	bnt.RegisteredClaims
+}
+
+// 创建测试用的claims
+func createClaims() *UserClaims {
+	now := time.Now().UTC()
+	expiresAt := now.Add(3 * time.Hour)
+	s := &UserInfo{}
+	s.User.Domain.Id = "5dbc59fd33e94b70a60d9b55633f53d2"
+	s.User.Domain.Name = "sys_svc_snms"
+	s.User.ID = "5dbc59fd33e94b70a60d9b55633f53d2"
+	s.User.Name.Account = "sys_svc_snms"
+	return &UserClaims{
+		UserInfo: s,
+		RegisteredClaims: bnt.RegisteredClaims{
+			Issuer:    "test_issuer",
+			Subject:   "test_subject",
+			Audience:  []string{"sys_svc_snms", "sys_svc_snms"},
+			ExpiresAt: &expiresAt, // 过期时间
+			NotBefore: &now,       // 生效时间
+			IssuedAt:  &now,       // 签发时间
+			ID:        "jti/d0fdd71e67f24c938f956f4b4522c208",
+		},
+	}
+}
+
 func main() {
 	// aesKey, hmacKey := generateTestKeys()
 	aesKey, hmacKey, err := GetKeysFromEnv()
@@ -104,17 +103,19 @@ func main() {
 		fmt.Printf("创建key方法失败: %v", err)
 		return
 	}
-	signingMethod, err := binarytoken.NewSigningMethodBinary(aesKey, hmacKey)
+	signingMethod, err := bnt.NewSigningMethodBinary(aesKey, hmacKey)
 	if err != nil {
 		fmt.Printf("创建签名方法失败: %v", err)
 	}
 	fmt.Println(aesKey)
 	fmt.Println(hmacKey)
 	fmt.Println("signingMethod", signingMethod)
+
 	// 创建claims和token
-	claims := createTestClaims()
-	token := binarytoken.NewToken(claims, signingMethod)
+	claims := createClaims()
+	token := bnt.NewToken(claims, signingMethod)
 	fmt.Println("claims", claims)
+
 	// 生成token字符串
 	tokenStr, err := token.SignedString()
 	if err != nil {
@@ -124,16 +125,17 @@ func main() {
 		fmt.Printf("生成的token为空字符串")
 	}
 	fmt.Println("==>", tokenStr)
-	// 解析并验证token
 
+	// 解析并验证token
 	parsedClaims := &UserClaims{}
-	parsedToken, err := binarytoken.Parse(tokenStr, parsedClaims, signingMethod)
+	parsedToken, err := bnt.Parse(tokenStr, parsedClaims, signingMethod)
 	if err != nil {
 		fmt.Printf("解析token失败: %v\n", err)
 		return
 	}
 
 	fmt.Printf("---+++++++===> %+v\n", parsedClaims)
+
 	// 验证token有效性
 	if err := parsedToken.Claims.Valid(); err != nil {
 		fmt.Printf("验证token有效性失败: %v\n", err)
