@@ -23,6 +23,30 @@ const (
 	MinHMACKeyLen = 16 // HMAC密钥最小长度
 )
 
+// 预定义错误
+var (
+	ErrInvalidKey                = errors.New("key is invalid")
+	ErrInvalidKeyType            = errors.New("key is of invalid type")
+	ErrHashUnavailable           = errors.New("the requested hash function is unavailable")
+	ErrTokenMalformed            = errors.New("token is malformed")
+	ErrTokenUnverifiable         = errors.New("token is unverifiable")
+	ErrTokenSignatureInvalid     = errors.New("token signature is invalid")
+	ErrTokenRequiredClaimMissing = errors.New("token is missing required claim")
+	ErrTokenInvalidAudience      = errors.New("token has invalid audience")
+	ErrTokenExpired              = errors.New("token is expired")
+	ErrTokenUsedBeforeIssued     = errors.New("token used before issued")
+	ErrTokenInvalidIssuer        = errors.New("token has invalid issuer")
+	ErrTokenInvalidSubject       = errors.New("token has invalid subject")
+	ErrTokenNotValidYet          = errors.New("token is not valid yet")
+	ErrTokenInvalidId            = errors.New("token has invalid id")
+	ErrTokenInvalidClaims        = errors.New("token has invalid claims")
+	ErrInvalidType               = errors.New("invalid type for claim")
+	ErrTokenTooShort             = errors.New("token is too short")
+	ErrTokenDecryptionFailed     = errors.New("token decryption failed")
+	ErrTokenInvalidFormat        = errors.New("token has invalid format")
+	ErrInvalidBase64             = errors.New("invalid base64 characters in token")
+)
+
 // 用于验证Base64字符串的正则表达式
 var base64Regex = regexp.MustCompile(`^[A-Za-z0-9+/]+(={0,2})$`)
 
@@ -31,14 +55,67 @@ type Claims interface {
 	Valid() error
 }
 
+// MarshalSingleStringAsArray 控制单个字符串是否作为数组序列化
+var MarshalSingleStringAsArray = true
+
+// ClaimStrings 可以序列化为字符串数组或单个字符串
+// 用于处理"aud"声明，它可以是单个字符串或数组
+type ClaimStrings []string
+
+// UnmarshalJSON 自定义JSON反序列化
+func (s *ClaimStrings) UnmarshalJSON(data []byte) (err error) {
+	var value interface{}
+
+	if err = json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+
+	var aud []string
+
+	switch v := value.(type) {
+	case string:
+		aud = append(aud, v)
+	case []string:
+		aud = ClaimStrings(v)
+	case []interface{}:
+		for _, vv := range v {
+			vs, ok := vv.(string)
+			if !ok {
+				return ErrInvalidType
+			}
+			aud = append(aud, vs)
+		}
+	case nil:
+		return nil
+	default:
+		return ErrInvalidType
+	}
+
+	*s = aud
+
+	return
+}
+
+// MarshalJSON 自定义JSON序列化
+func (s ClaimStrings) MarshalJSON() (b []byte, err error) {
+	// 处理JWT RFC中的特殊情况
+	// 如果字符串数组（例如"aud"字段）只包含一个元素，可以序列化为单个字符串
+	if len(s) == 1 && !MarshalSingleStringAsArray {
+		return json.Marshal(s[0])
+	}
+
+	return json.Marshal([]string(s))
+}
+
 // RegisteredClaims 包含标准的声明字段
 type RegisteredClaims struct {
-	ExpiresAt *time.Time `json:"exp,omitempty"` // 过期时间
-	IssuedAt  *time.Time `json:"iat,omitempty"` // 签发时间
-	NotBefore *time.Time `json:"nbf,omitempty"` // 生效时间
-	Issuer    string     `json:"iss,omitempty"` // 签发者
-	Subject   string     `json:"sub,omitempty"` // 主题
-	ID        string     `json:"jti,omitempty"` // Token ID
+	Issuer    string       `json:"iss,omitempty"` // 签发者
+	Subject   string       `json:"sub,omitempty"` // 主题
+	Audience  ClaimStrings `json:"aud,omitempty"` // 接收者
+	ExpiresAt *time.Time   `json:"exp,omitempty"` // 过期时间
+	NotBefore *time.Time   `json:"nbf,omitempty"` // 生效时间
+	IssuedAt  *time.Time   `json:"iat,omitempty"` // 签发时间
+	ID        string       `json:"jti,omitempty"` // Token ID
 }
 
 // Valid 验证标准声明
@@ -49,7 +126,7 @@ func (c *RegisteredClaims) Valid() error {
 	if c.ExpiresAt != nil && !c.ExpiresAt.IsZero() {
 		expTime := *c.ExpiresAt
 		if expTime.Before(now) {
-			return errors.New("token is expired")
+			return ErrTokenExpired
 		}
 	}
 
@@ -57,7 +134,7 @@ func (c *RegisteredClaims) Valid() error {
 	if c.NotBefore != nil && !c.NotBefore.IsZero() {
 		nbfTime := *c.NotBefore
 		if nbfTime.After(now) {
-			return errors.New("token is not valid yet")
+			return ErrTokenNotValidYet
 		}
 	}
 
@@ -65,7 +142,7 @@ func (c *RegisteredClaims) Valid() error {
 	if c.IssuedAt != nil && !c.IssuedAt.IsZero() {
 		iatTime := *c.IssuedAt
 		if iatTime.After(now) {
-			return errors.New("token issued in the future")
+			return ErrTokenUsedBeforeIssued
 		}
 	}
 
@@ -76,7 +153,7 @@ func (c *RegisteredClaims) Valid() error {
 type SigningMethod interface {
 	Alg() string
 	Sign(payload []byte) ([]byte, error)
-	Verify(payload, signature []byte) error
+	Verify(signedData []byte) ([]byte, error)
 }
 
 // SigningMethodBinary 二进制签名实现
@@ -136,40 +213,36 @@ func (s *SigningMethodBinary) Sign(payload []byte) ([]byte, error) {
 	return append(encryptedPayload, signature...), nil
 }
 
-// Verify 验证签名
-func (s *SigningMethodBinary) Verify(payload, signature []byte) error {
+// Verify 验证签名并返回解密后的payload
+func (s *SigningMethodBinary) Verify(signedData []byte) ([]byte, error) {
 	// 步骤1: 检查长度
-	if len(signature) < HMACSigLen {
-		return errors.New("invalid token: too short")
+	if len(signedData) < HMACSigLen+GCMNonceLen {
+		return nil, ErrTokenTooShort
 	}
 
 	// 步骤2: 分离加密payload和签名
-	encryptedPayload := signature[:len(signature)-HMACSigLen]
-	receivedSig := signature[len(signature)-HMACSigLen:]
+	encryptedPayload := signedData[:len(signedData)-HMACSigLen]
+	receivedSig := signedData[len(signedData)-HMACSigLen:]
 
 	// 步骤3: 验证HMAC签名
 	mac := hmac.New(sha256.New, s.hmacKey)
 	if _, err := mac.Write(encryptedPayload); err != nil {
-		return fmt.Errorf("failed to write to hmac: %w", err)
+		return nil, fmt.Errorf("failed to write to hmac: %w", err)
 	}
 	expectedSig := mac.Sum(nil)
 	if !hmac.Equal(receivedSig, expectedSig) {
-		return errors.New("invalid token: signature mismatch")
+		return nil, ErrTokenSignatureInvalid
 	}
 
-	// 步骤4: 解密并验证payload
+	// 步骤4: 解密payload
 	block, err := aes.NewCipher(s.aesKey)
 	if err != nil {
-		return fmt.Errorf("failed to create cipher: %w", err)
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
 
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return fmt.Errorf("failed to create GCM: %w", err)
-	}
-
-	if len(encryptedPayload) < GCMNonceLen {
-		return errors.New("invalid token: encrypted payload too short")
+		return nil, fmt.Errorf("failed to create GCM: %w", err)
 	}
 
 	nonce := encryptedPayload[:GCMNonceLen]
@@ -178,15 +251,10 @@ func (s *SigningMethodBinary) Verify(payload, signature []byte) error {
 	// 解密
 	decryptedPayload, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return fmt.Errorf("decryption failed: %w", err)
+		return nil, ErrTokenDecryptionFailed
 	}
 
-	// 检查解密后的payload是否与原始payload一致
-	if !hmac.Equal(decryptedPayload, payload) {
-		return errors.New("invalid token: payload mismatch")
-	}
-
-	return nil
+	return decryptedPayload, nil
 }
 
 // Token 表示一个令牌对象
@@ -210,19 +278,19 @@ func (t *Token) SignedString() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal claims failed: %w", err)
 	}
-	fmt.Println(claimsBytes)
+
 	// 签名
 	signedBytes, err := t.Method.Sign(claimsBytes)
 	if err != nil {
 		return "", fmt.Errorf("signing failed: %w", err)
 	}
-	fmt.Println(" 签名>>>", signedBytes)
+
 	// 使用标准Base64编码，确保URL安全
 	encoded := base64.StdEncoding.EncodeToString(signedBytes)
-	fmt.Println(" Base64>>>", encoded)
+
 	// 验证生成的Base64字符串是否符合标准
 	if !base64Regex.MatchString(encoded) {
-		return "", errors.New("generated token contains invalid base64 characters")
+		return "", ErrInvalidBase64
 	}
 
 	return encoded, nil
@@ -232,7 +300,7 @@ func (t *Token) SignedString() (string, error) {
 func Parse(tokenStr string, claims Claims, method SigningMethod) (*Token, error) {
 	// 验证输入的Base64格式
 	if !base64Regex.MatchString(tokenStr) {
-		return nil, errors.New("invalid base64 characters in token")
+		return nil, ErrInvalidBase64
 	}
 
 	// Base64解码
@@ -241,38 +309,10 @@ func Parse(tokenStr string, claims Claims, method SigningMethod) (*Token, error)
 		return nil, fmt.Errorf("base64 decode failed: %w", err)
 	}
 
-	// 提取加密的payload部分
-	if len(tokenBytes) < HMACSigLen {
-		return nil, errors.New("invalid token: too short")
-	}
-	encryptedPayload := tokenBytes[:len(tokenBytes)-HMACSigLen]
-
-	// 解密payload
-	binaryMethod, ok := method.(*SigningMethodBinary)
-	if !ok {
-		return nil, errors.New("unsupported signing method")
-	}
-
-	block, err := aes.NewCipher(binaryMethod.aesKey)
+	// 验证签名并获取解密后的payload
+	decryptedBytes, err := method.Verify(tokenBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GCM: %w", err)
-	}
-
-	if len(encryptedPayload) < GCMNonceLen {
-		return nil, errors.New("invalid token: encrypted payload too short")
-	}
-
-	nonce := encryptedPayload[:GCMNonceLen]
-	ciphertext := encryptedPayload[GCMNonceLen:]
-
-	decryptedBytes, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, fmt.Errorf("decryption failed: %w", err)
+		return nil, fmt.Errorf("signature verification failed: %w", err)
 	}
 
 	// 反序列化到claims
@@ -283,11 +323,6 @@ func Parse(tokenStr string, claims Claims, method SigningMethod) (*Token, error)
 	// 验证claims
 	if err := claims.Valid(); err != nil {
 		return nil, fmt.Errorf("invalid claims: %w", err)
-	}
-
-	// 验证签名
-	if err := method.Verify(decryptedBytes, tokenBytes); err != nil {
-		return nil, fmt.Errorf("signature verification failed: %w", err)
 	}
 
 	// 创建并返回token对象
@@ -313,11 +348,11 @@ func (uc *UserClaims) Valid() error {
 
 	// 验证自定义字段
 	if uc.UserID == "" {
-		return errors.New("user_id is required")
+		return ErrTokenRequiredClaimMissing
 	}
 
 	if uc.Username == "" {
-		return errors.New("username is required")
+		return ErrTokenRequiredClaimMissing
 	}
 
 	return nil
