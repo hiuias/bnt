@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/hiuias/bnt/bnt"
+	"github.com/hiuias/bnt"
 	"time"
 )
 
