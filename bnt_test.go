@@ -47,8 +47,6 @@ func createTestClaims() *UserClaims {
 		UserID:   "test_user_123",
 		Username: "test_user",
 		RegisteredClaims: RegisteredClaims{
-			Issuer:    "test_issuer",
-			Subject:   "test_subject",
 			ID:        "test_jti_456",
 			ExpiresAt: &exp,
 			IssuedAt:  &now,
@@ -103,12 +101,6 @@ func TestTokenGenerationAndVerification(t *testing.T) {
 	if parsedClaims.Username != claims.Username {
 		t.Errorf("Username want %s got %s", claims.Username, parsedClaims.Username)
 	}
-	if parsedClaims.Issuer != claims.Issuer {
-		t.Errorf("Issuer want %s got %s", claims.Issuer, parsedClaims.Issuer)
-	}
-	if parsedClaims.Subject != claims.Subject {
-		t.Errorf("Subject want %s got %s", claims.Subject, parsedClaims.Subject)
-	}
 	if parsedClaims.ID != claims.ID {
 		t.Errorf("ID want %s got %s", claims.ID, parsedClaims.ID)
 	}
@@ -138,8 +130,6 @@ func TestExpiredToken(t *testing.T) {
 		UserID:   "exp_user01",
 		Username: "expired",
 		RegisteredClaims: RegisteredClaims{
-			Issuer:    "test_issuer",
-			Subject:   "sub_exp",
 			ID:        "jti_exp01",
 			ExpiresAt: &exp,
 			IssuedAt:  &now,
@@ -176,8 +166,6 @@ func TestNotYetValidToken(t *testing.T) {
 		UserID:   "future01",
 		Username: "future",
 		RegisteredClaims: RegisteredClaims{
-			Issuer:    "test_issuer",
-			Subject:   "sub_future",
 			ID:        "jti_f01",
 			NotBefore: &nbf,
 			IssuedAt:  &now,
@@ -274,8 +262,6 @@ func TestCustomClaimsValidation(t *testing.T) {
 	claimsNoUID := &UserClaims{
 		Username: "no_uid_user",
 		RegisteredClaims: RegisteredClaims{
-			Issuer:    "test_issuer",
-			Subject:   "sub_no_uid",
 			ID:        "jti_nouid",
 			ExpiresAt: &exp,
 			IssuedAt:  &now,
@@ -301,8 +287,6 @@ func TestCustomClaimsValidation(t *testing.T) {
 	claimsNoUname := &UserClaims{
 		UserID: "u1002",
 		RegisteredClaims: RegisteredClaims{
-			Issuer:    "test_issuer",
-			Subject:   "sub_no_uname",
 			ID:        "jti_nouname",
 			ExpiresAt: &exp,
 			IssuedAt:  &now,

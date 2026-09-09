@@ -1,12 +1,14 @@
 package bnt
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,13 +16,16 @@ import (
 	"time"
 )
 
+// [4字节Kid][4字节随机数][1字节版本][3字节保留][1字节标志][2字节原始Token长度][原始Token][12B nonce]
+
 // 常量定义（安全参数）
 const (
-	AESKeyLen     = 32   // AES-256 密钥长度（必须32字节）
-	GCMNonceLen   = 12   // GCM推荐Nonce长度
-	HMACSigLen    = 32   // HMAC-SHA256 签名长度
-	MinHMACKeyLen = 16   // HMAC密钥最小长度
-	MaxTokenLen   = 8192 // 最大token长度限制（8KB）
+	AESKeyLen      = 32   // AES-256 密钥长度（必须32字节）
+	GCMNonceLen    = 12   // GCM推荐Nonce长度
+	HMACSigLen     = 32   // HMAC-SHA256 签名长度
+	MinHMACKeyLen  = 16   // HMAC密钥最小长度
+	MaxTokenLen    = 8192 // 最大token长度限制（8KB）
+	HeaderPlainLen = 15   // 头部总长度：4Kid+4rand+1ver+3rsv+1flag+2len
 )
 
 // 预定义错误
@@ -150,36 +155,20 @@ type Claims interface {
 	Valid() error
 }
 
-// ClaimStrings 可以序列化为字符串数组或单个字符串
-type ClaimStrings []string
-
 // RegisteredClaims 包含标准的声明字段
 type RegisteredClaims struct {
-	Audience      ClaimStrings `json:"aud,omitempty"` // 接收者
-	Issuer        string       `json:"iss,omitempty"` // 签发者
-	Subject       string       `json:"sub,omitempty"` // 主题
-	ID            string       `json:"jti,omitempty"` // Token ID
-	ExpiresAt     *time.Time   `json:"exp,omitempty"` // 过期时间
-	NotBefore     *time.Time   `json:"nbf,omitempty"` // 生效时间
-	IssuedAt      *time.Time   `json:"iat,omitempty"` // 签发时间
-	Ttl           uint32       `json:"ttl,omitempty"` // 有效时长（秒）
-	IssueCount    uint32       `json:"isc,omitempty"` // 续签累计次数
-	MaxIssueCount uint32       `json:"mic,omitempty"` // 最大允许续签次数
+	ExpiresAt     *time.Time `json:"exp,omitempty"` // 过期时间
+	NotBefore     *time.Time `json:"nbf,omitempty"` // 生效时间
+	IssuedAt      *time.Time `json:"iat,omitempty"` // 签发时间
+	ID            string     `json:"jti,omitempty"` // Token ID
+	Ttl           uint32     `json:"ttl,omitempty"` // 有效时长（秒）
+	IssueCount    uint32     `json:"isc,omitempty"` // 续签累计次数
+	MaxIssueCount uint32     `json:"mic,omitempty"` // 最大允许续签次数
 }
 
 // Valid 验证标准声明
 func (c *RegisteredClaims) Valid() error {
 	now := time.Now().UTC()
-
-	// 验证签发者
-	if c.Issuer == "" {
-		return ErrTokenInvalidIssuer
-	}
-
-	// 验证主题
-	if c.Subject == "" {
-		return ErrTokenInvalidSubject
-	}
 
 	// 验证ID
 	if c.ID == "" {
@@ -237,7 +226,7 @@ type SigningMethod interface {
 type SigningMethodBinary struct {
 	aesKey  []byte
 	hmacKey []byte
-	kid     string // Key ID，用于密钥轮换
+	kid     uint32 // Key ID，用于密钥轮换
 }
 
 // NewSigningMethodBinary 创建新的二进制签名方法
@@ -251,12 +240,12 @@ func NewSigningMethodBinary(aesKey, hmacKey []byte) (*SigningMethodBinary, error
 	return &SigningMethodBinary{
 		aesKey:  aesKey,
 		hmacKey: hmacKey,
-		kid:     "",
+		kid:     uint32(time.Now().Unix()),
 	}, nil
 }
 
 // NewSigningMethodBinaryWithKID 创建带Key ID的二进制签名方法
-func NewSigningMethodBinaryWithKID(aesKey, hmacKey []byte, kid string) (*SigningMethodBinary, error) {
+func NewSigningMethodBinaryWithKID(aesKey, hmacKey []byte, kid uint32) (*SigningMethodBinary, error) {
 	method, err := NewSigningMethodBinary(aesKey, hmacKey)
 	if err != nil {
 		return nil, err
@@ -267,101 +256,181 @@ func NewSigningMethodBinaryWithKID(aesKey, hmacKey []byte, kid string) (*Signing
 
 // Alg 返回算法名称
 func (s *SigningMethodBinary) Alg() string {
-	if s.kid != "" {
-		return fmt.Sprintf("BINARY-HS256-KID-%s", s.kid)
+	if s.kid != 0 {
+		return fmt.Sprintf("BINARY-HS256-KID-%d", s.kid)
 	}
 	return "BINARY-HS256"
 }
 
 // Sign 对payload进行签名，返回二进制token
 func (s *SigningMethodBinary) Sign(payload []byte) ([]byte, error) {
-	// 步骤1: AES-GCM加密payload
+	if s.kid == 0 {
+		return nil, errors.New("kid not configured")
+	}
+	if len(s.aesKey) != AESKeyLen {
+		return nil, errors.New("aesKey must be 32 bytes for AES‑256")
+	}
+	if len(s.hmacKey) < MinHMACKeyLen {
+		return nil, errors.New("hmacKey too short, min 16 bytes")
+	}
+
 	block, err := aes.NewCipher(s.aesKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrCipherCreation, err)
 	}
-
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrGCMCreation, err)
 	}
 
+	// 4字节随机数
+	prefixRand := make([]byte, 4)
+	if _, err := io.ReadFull(rand.Reader, prefixRand); err != nil {
+		return nil, fmt.Errorf("rand prefix failed: %w", err)
+	}
+	// GCM nonce 12字节
 	nonce := make([]byte, GCMNonceLen)
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrNonceGeneration, err)
+		return nil, fmt.Errorf("rand nonce failed: %w", err)
 	}
 
-	// 加密，结果包含nonce
-	encryptedPayload := gcm.Seal(nonce, nonce, payload, nil)
+	// ==========组装15字节明文头部==========
+	plainHeader := make([]byte, HeaderPlainLen)
+	// 0‑3: kid uint32大端
+	binary.BigEndian.PutUint32(plainHeader[0:4], s.kid)
+	// 4‑7:4字节随机数
+	copy(plainHeader[4:8], prefixRand)
+	// 8:版本 0x01
+	plainHeader[8] = 0x01
+	//9‑11:保留位 0
+	copy(plainHeader[9:12], []byte{0, 0, 0})
+	//12:flags
+	var flags byte = 0x01
+	plainHeader[12] = flags
+	// 13‑14 fullCipherLen 暂时留0，加密完成回填
 
-	// 步骤2: HMAC-SHA256签名
+	// AAD取前13字节！排除后面2字节密文长度（加密前不知道长度）
+	aad := plainHeader[:13]
+
+	// AES‑GCM加密 payload，fullCipherText = cipher+tag
+	fullCipherText := gcm.Seal(nil, nonce, payload, aad)
+
+	// 加密完成后回填密文长度到头部
+	binary.BigEndian.PutUint16(plainHeader[13:15], uint16(len(fullCipherText)))
+
+	// innerPayload = plainHeader(15) + fullCipherText + nonce(12)
+	innerPayloadBuf := make([]byte, 0, HeaderPlainLen+len(fullCipherText)+GCMNonceLen)
+	innerPayloadBuf = append(innerPayloadBuf, plainHeader...)
+	innerPayloadBuf = append(innerPayloadBuf, fullCipherText...)
+	innerPayloadBuf = append(innerPayloadBuf, nonce...)
+
+	// HMAC‑SHA256 对innerPayloadBuf签名
 	mac := hmac.New(sha256.New, s.hmacKey)
-	if _, err := mac.Write(encryptedPayload); err != nil {
+	if _, err = mac.Write(innerPayloadBuf); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrHMACCalculation, err)
 	}
-
 	signature := mac.Sum(nil)
 
-	// 步骤3: 拼接二进制流（加密payload + 签名）
-	return append(encryptedPayload, signature...), nil
+	// 最终二进制 = innerPayload + HMAC签名
+	finalToken := append(append([]byte(nil), innerPayloadBuf...), signature...)
+	return finalToken, nil
 }
 
 // Verify 验证签名并返回解密后的payload
 func (s *SigningMethodBinary) Verify(signedData []byte) ([]byte, error) {
-	// 步骤1: 检查长度
-	if len(signedData) < HMACSigLen+GCMNonceLen {
+	const minFullCipher = 16 // GCM最小密文长度(仅tag)
+
+	if len(signedData) > MaxTokenLen {
+		return nil, ErrTokenTooShort
+	}
+	//最小长度：15头部 + 最小密文16 + nonce12 + hmac32
+	minTotal := HeaderPlainLen + minFullCipher + GCMNonceLen + HMACSigLen
+	if len(signedData) < minTotal {
 		return nil, ErrTokenTooShort
 	}
 
-	// 步骤2: 分离加密payload和签名
-	encryptedPayload := signedData[:len(signedData)-HMACSigLen]
+	innerPayload := signedData[:len(signedData)-HMACSigLen]
 	receivedSig := signedData[len(signedData)-HMACSigLen:]
 
-	// 验证加密payload至少包含nonce + 至少1字节密文
-	if len(encryptedPayload) < GCMNonceLen+1 {
-		return nil, ErrTokenTooShort
-	}
-
-	// 步骤3: 验证HMAC签名
+	//第一步 HMAC签名校验
 	mac := hmac.New(sha256.New, s.hmacKey)
-	if _, err := mac.Write(encryptedPayload); err != nil {
+	if _, err := mac.Write(innerPayload); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrHMACCalculation, err)
 	}
-	expectedSig := mac.Sum(nil)
-	if !hmac.Equal(receivedSig, expectedSig) {
+	expectSig := mac.Sum(nil)
+	if !hmac.Equal(receivedSig, expectSig) {
 		return nil, ErrTokenSignatureInvalid
 	}
 
-	// 步骤4: 解密payload
+	offset := 0
+	plainHeader := innerPayload[offset : offset+HeaderPlainLen]
+	offset += HeaderPlainLen
+
+	//解析明文头部
+	kid := binary.BigEndian.Uint32(plainHeader[0:4])
+	ver := plainHeader[8]
+	reserved := plainHeader[9:12]
+	flags := plainHeader[12]
+	fullCipherLen := int(binary.BigEndian.Uint16(plainHeader[13:15]))
+
+	//协议版本、保留位、标志校验
+	if ver != 0x01 {
+		return nil, ErrTokenDecryptionFailed
+	}
+	if !bytes.Equal(reserved, []byte{0, 0, 0}) {
+		return nil, ErrTokenDecryptionFailed
+	}
+	if flags != 0x01 {
+		return nil, ErrTokenDecryptionFailed
+	}
+
+	//fullCipherLen安全边界校验
+	maxAllowedCipher := MaxTokenLen - (HeaderPlainLen + GCMNonceLen + HMACSigLen)
+	if fullCipherLen < minFullCipher || fullCipherLen > maxAllowedCipher {
+		return nil, ErrTokenDecryptionFailed
+	}
+
+	remain := len(innerPayload) - offset
+	need := fullCipherLen + GCMNonceLen
+	if remain != need {
+		return nil, ErrTokenTooShort
+	}
+
+	fullCipherText := innerPayload[offset : offset+fullCipherLen]
+	offset += fullCipherLen
+	nonce := innerPayload[offset : offset+GCMNonceLen]
+
+	//校验kid与当前method实例匹配
+	if kid != s.kid {
+		return nil, ErrTokenSignatureInvalid
+	}
+
+	//AAD取完整13字节明文头部（已经包含4字节随机数）
+	aad := plainHeader[:13]
+
 	block, err := aes.NewCipher(s.aesKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrCipherCreation, err)
 	}
-
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrGCMCreation, err)
 	}
 
-	nonce := encryptedPayload[:GCMNonceLen]
-	ciphertext := encryptedPayload[GCMNonceLen:]
-
-	// 解密
-	decryptedPayload, err := gcm.Open(nil, nonce, ciphertext, nil)
+	plain, err := gcm.Open(nil, nonce, fullCipherText, aad)
 	if err != nil {
 		return nil, ErrTokenDecryptionFailed
 	}
 
-	return decryptedPayload, nil
+	return plain, nil
 }
 
 // Token 表示一个令牌对象
 type Token struct {
-	Raw       string         // 原始令牌字符串
-	Claims    Claims         // 声明对象
-	Method    SigningMethod  // 签名方法
-	Signature []byte         // 签名部分
-	Header    map[string]any // 头部信息（兼容JWT格式）
+	Raw       string        // 原始令牌字符串
+	Claims    Claims        // 声明对象
+	Method    SigningMethod // 签名方法
+	Signature []byte        // 签名部分
 }
 
 // NewToken 创建一个新的Token
@@ -369,10 +438,6 @@ func NewToken(claims Claims, method SigningMethod) *Token {
 	return &Token{
 		Claims: claims,
 		Method: method,
-		Header: map[string]any{
-			"alg": method.Alg(),
-			"typ": "JWT",
-		},
 	}
 }
 
@@ -404,11 +469,12 @@ func (t *Token) SignedString() (string, error) {
 
 // Refreshable 接口
 type Refreshable interface {
-	Refresh() error
+	Refresh(tid string) error
 }
 
 // RegisteredClaims 实现 Refreshable
-func (c *RegisteredClaims) Refresh() error {
+func (c *RegisteredClaims) Refresh(tid string) error {
+
 	// 1. 检查是否允许续签
 	if c.MaxIssueCount == 0 {
 		return ErrTokenRefreshNotAllowed
@@ -440,6 +506,11 @@ func (c *RegisteredClaims) Refresh() error {
 		return ErrTokenRefreshInvalidTTL
 	}
 
+	if tid == "" {
+		return ErrTokenInvalidId
+	}
+
+	c.ID = tid
 	c.IssueCount++
 	c.IssuedAt = &now
 	c.NotBefore = &now
@@ -451,9 +522,9 @@ func (c *RegisteredClaims) Refresh() error {
 }
 
 // Token 的 Refresh 方法
-func (t *Token) Refresh() error {
+func (t *Token) Refresh(tid string) error {
 	if refreshable, ok := t.Claims.(Refreshable); ok {
-		return refreshable.Refresh()
+		return refreshable.Refresh(tid)
 	}
 	return errors.New("claims does not implement Refreshable interface")
 }
@@ -492,10 +563,6 @@ func Parse(tokenStr string, claims Claims, method SigningMethod) (*Token, error)
 		Raw:    tokenStr,
 		Claims: claims,
 		Method: method,
-		Header: map[string]any{
-			"alg": method.Alg(),
-			"typ": "JWT",
-		},
 	}
 
 	return token, nil
@@ -517,13 +584,9 @@ func ParseWithClaims(tokenStr string, claims Claims, keyFunc func(*Token) (Signi
 		return nil, ErrTokenTooShort
 	}
 
-	// 创建临时令牌以获取算法信息
+	// 创建临时令牌
 	token := &Token{
 		Raw: tokenStr,
-		Header: map[string]any{
-			"alg": "BINARY-HS256", // 固定算法
-			"typ": "JWT",
-		},
 	}
 
 	// 获取签名方法
