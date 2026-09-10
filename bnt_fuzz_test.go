@@ -63,8 +63,32 @@ func FuzzBntRawBytes(f *testing.F) {
 	})
 }
 
-// # 默认运行一段时间，自动发现异常
-// go test -fuzz=FuzzBntParse -fuzztime=30s
+func FuzzBntSignVerify(f *testing.F) {
+	method, err := NewSigningMethodBinaryWithKID(testAESKey, testHMACKey, testKID)
+	if err != nil {
+		f.Fatal(err)
+	}
+	now := time.Now().UTC()
+	seedClaims := &RegisteredClaims{
+		ID:        "fuzz-sign-verify",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(seedClaims, method)
+	seedToken, err := tok.SignedString()
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seedToken)
 
-// # 同时跑两个fuzz
-// go test -fuzz=. -fuzztime=60s
+	f.Fuzz(func(t *testing.T, tokenStr string) {
+		out := &RegisteredClaims{}
+		_, _ = Parse(tokenStr, out, method)
+	})
+}
+
+// # 运行一段时间，自动发现异常
+// go test -fuzz=FuzzBntParse -fuzztime=120s
+// go test -fuzz=FuzzBntRawBytes -fuzztime=120s
+// go test -fuzz=FuzzBntSignVerify -fuzztime=120s

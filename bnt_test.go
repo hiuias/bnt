@@ -2,6 +2,7 @@ package bnt
 
 import (
 	"encoding/base64"
+	"errors"
 	"testing"
 	"time"
 )
@@ -266,7 +267,6 @@ func TestSignWrongKid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	now := time.Now().UTC()
 	claims := &RegisteredClaims{
 		ID:        "jti-kidtest",
@@ -279,11 +279,13 @@ func TestSignWrongKid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	outClaims := &RegisteredClaims{}
 	_, err = Parse(tokenStr, outClaims, m2)
 	if err == nil {
-		t.Error("different kid should trigger signature invalid error")
+		t.Error("different kid should return ErrTokenKidMismatch")
+	}
+	if !errors.Is(err, ErrTokenKidMismatch) {
+		t.Errorf("want root ErrTokenKidMismatch, got %v", err)
 	}
 }
 

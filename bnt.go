@@ -67,6 +67,7 @@ var (
 	ErrHMACCalculation           = errors.New("failed to calculate HMAC")
 	ErrClaimsMarshaling          = errors.New("failed to marshal claims")
 	ErrClaimsUnmarshaling        = errors.New("failed to unmarshal claims")
+	ErrTokenKidMismatch          = errors.New("token kid mismatch")
 )
 
 // VerificationError 提供更详细的错误上下文
@@ -417,7 +418,7 @@ func (s *SigningMethodBinary) Verify(signedData []byte) ([]byte, error) {
 
 	// 校验kid与当前method实例匹配
 	if kid != s.kid {
-		return nil, ErrTokenSignatureInvalid
+		return nil, ErrTokenKidMismatch
 	}
 
 	// AAD取完整16字节明文头部（与Sign一致）
