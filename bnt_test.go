@@ -509,5 +509,67 @@ func BenchmarkVerify(b *testing.B) {
 	}
 }
 
+func BenchmarkToken_SignedString(b *testing.B) {
+	aesKey := []byte("0123456789abcdef0123456789abcdef")
+	hmacKey := []byte("hmac-key-for-bench-000000000000")
+
+	method, err := NewSigningMethodBinaryWithKID(aesKey, hmacKey, 1001)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "bench‑jti‑000001",
+		IssuedAt:  ptrTime(now),
+		ExpiresAt: ptrTime(now.Add(2 * time.Hour)),
+		Ttl:       7200,
+	}
+
+	b.ResetTimer() // 跳过初始化耗时
+
+	for i := 0; i < b.N; i++ {
+		tok := NewToken(claims, method)
+		_, err := tok.SignedString()
+		if err != nil {
+			b.Fatalf("SignedString failed: %v", err)
+		}
+	}
+}
+
+// 完整端到端解析：Parse，包含base64解码、解密、验签
+func BenchmarkParse_FullEndToEnd(b *testing.B) {
+	aesKey := []byte("0123456789abcdef0123456789abcdef")
+	hmacKey := []byte("hmac-key-for-bench-000000000000")
+
+	method, err := NewSigningMethodBinaryWithKID(aesKey, hmacKey, 1001)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "bench‑jti‑000001",
+		IssuedAt:  ptrTime(now),
+		ExpiresAt: ptrTime(now.Add(2 * time.Hour)),
+		Ttl:       7200,
+	}
+	tok := NewToken(claims, method)
+	tokenStr, err := tok.SignedString()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		out := &RegisteredClaims{}
+		_, err := Parse(tokenStr, out, method)
+		if err != nil {
+			b.Fatalf("parse failed: %v", err)
+		}
+	}
+}
+
 // go test -v ./...
 // go test -bench=. -benchmem
