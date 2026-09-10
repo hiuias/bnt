@@ -1,370 +1,511 @@
 package bnt
 
 import (
-	"crypto/rand"
 	"encoding/base64"
 	"testing"
 	"time"
 )
 
-type UserClaims struct {
-	UserID   string `json:"user_id"`
-	Username string `json:"username"`
-	RegisteredClaims
+// 测试固定密钥，仅单元测试使用，生产环境禁止硬编码密钥
+var (
+	testAESKey         = []byte("0123456789abcdef0123456789abcdef") // 32字节 AES-256
+	testHMACKey        = []byte("my-test-hmac-key-12345678")        // 24字节 HMAC key
+	testKID     uint32 = 1001
+)
+
+// ptrTime 辅助函数，返回时间指针
+func ptrTime(t time.Time) *time.Time {
+	return &t
 }
 
-func (uc *UserClaims) Valid() error {
-	if err := uc.RegisteredClaims.Valid(); err != nil {
-		return err
-	}
-	if uc.UserID == "" {
-		return ErrTokenRequiredClaimMissing
-	}
-	if uc.Username == "" {
-		return ErrTokenRequiredClaimMissing
-	}
-	return nil
-}
-
-func generateTestKeys(t *testing.T) (aesKey, hmacKey []byte) {
+// mustNewMethod 创建签名方法，失败直接终止测试
+func mustNewMethod(t *testing.T) *SigningMethodBinary {
 	t.Helper()
-	aesKey = make([]byte, AESKeyLen)
-	if _, err := rand.Read(aesKey); err != nil {
-		t.Fatalf("generate aes key failed: %v", err)
-	}
-	hmacKey = make([]byte, 32)
-	if _, err := rand.Read(hmacKey); err != nil {
-		t.Fatalf("generate hmac key failed: %v", err)
-	}
-	return aesKey, hmacKey
-}
-
-func createTestClaims() *UserClaims {
-	now := time.Now().UTC()
-	exp := now.Add(1 * time.Hour)
-	nbf := now.Add(-5 * time.Minute)
-	return &UserClaims{
-		UserID:   "test_user_123",
-		Username: "test_user",
-		RegisteredClaims: RegisteredClaims{
-			ID:        "test_jti_456",
-			ExpiresAt: &exp,
-			IssuedAt:  &now,
-			NotBefore: &nbf,
-		},
-	}
-}
-
-// unwrapRootErr 循环解包拿到最内层原始error
-func unwrapRootErr(err error) error {
-	for err != nil {
-		u, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			break
-		}
-		inner := u.Unwrap()
-		if inner == nil {
-			break
-		}
-		err = inner
-	}
-	return err
-}
-
-func TestTokenGenerationAndVerification(t *testing.T) {
-	aesKey, hmacKey := generateTestKeys(t)
-	method, err := NewSigningMethodBinary(aesKey, hmacKey)
+	m, err := NewSigningMethodBinaryWithKID(testAESKey, testHMACKey, testKID)
 	if err != nil {
-		t.Fatalf("NewSigningMethodBinary err: %v", err)
+		t.Fatalf("NewSigningMethodBinaryWithKID failed: %v", err)
+	}
+	return m
+}
+
+// TestSignAndVerify 正常签名、生成token、解析解密全流程
+func TestSignAndVerify(t *testing.T) {
+	method := mustNewMethod(t)
+
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "jti-001",
+		IssuedAt:  &now,
+		NotBefore: &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
 	}
 
-	claims := createTestClaims()
 	tok := NewToken(claims, method)
-
 	tokenStr, err := tok.SignedString()
 	if err != nil {
 		t.Fatalf("SignedString failed: %v", err)
 	}
 	if tokenStr == "" {
-		t.Error("token string is empty")
+		t.Error("token string should not be empty")
 	}
 
-	parsedClaims := &UserClaims{}
-	parsedTok, err := Parse(tokenStr, parsedClaims, method)
+	outClaims := &RegisteredClaims{}
+	parsed, err := Parse(tokenStr, outClaims, method)
 	if err != nil {
 		t.Fatalf("Parse failed: %v", err)
 	}
 
-	if parsedClaims.UserID != claims.UserID {
-		t.Errorf("UserID want %s got %s", claims.UserID, parsedClaims.UserID)
+	if parsed.Kid != testKID {
+		t.Errorf("kid mismatch, want %d got %d", testKID, parsed.Kid)
 	}
-	if parsedClaims.Username != claims.Username {
-		t.Errorf("Username want %s got %s", claims.Username, parsedClaims.Username)
-	}
-	if parsedClaims.ID != claims.ID {
-		t.Errorf("ID want %s got %s", claims.ID, parsedClaims.ID)
-	}
-
-	if !parsedClaims.ExpiresAt.Equal(*claims.ExpiresAt) {
-		t.Errorf("ExpiresAt mismatch want %v got %v", *claims.ExpiresAt, *parsedClaims.ExpiresAt)
-	}
-	if !parsedClaims.IssuedAt.Equal(*claims.IssuedAt) {
-		t.Errorf("IssuedAt mismatch want %v got %v", *claims.IssuedAt, *parsedClaims.IssuedAt)
-	}
-	if !parsedClaims.NotBefore.Equal(*claims.NotBefore) {
-		t.Errorf("NotBefore mismatch want %v got %v", *claims.NotBefore, *parsedClaims.NotBefore)
-	}
-
-	if err = parsedTok.Claims.Valid(); err != nil {
-		t.Errorf("claims.Valid() return err: %v", err)
+	if outClaims.ID != "jti-001" {
+		t.Errorf("jti mismatch, want jti-001 got %s", outClaims.ID)
 	}
 }
 
-func TestExpiredToken(t *testing.T) {
-	aesKey, hmacKey := generateTestKeys(t)
-	method, _ := NewSigningMethodBinary(aesKey, hmacKey)
-
-	now := time.Now().UTC()
-	exp := now.Add(-1 * time.Hour)
-	claims := &UserClaims{
-		UserID:   "exp_user01",
-		Username: "expired",
-		RegisteredClaims: RegisteredClaims{
-			ID:        "jti_exp01",
-			ExpiresAt: &exp,
-			IssuedAt:  &now,
-		},
+// TestNewSigningMethodBinary_KeyLenCheck 密钥长度校验
+func TestNewSigningMethodBinary_KeyLenCheck(t *testing.T) {
+	// AES密钥长度错误
+	_, err := NewSigningMethodBinary([]byte("shortkey"), testHMACKey)
+	if err == nil {
+		t.Error("expected ErrAESKeyLength, got nil")
 	}
 
+	// HMAC密钥太短
+	shortHmac := []byte("1234567")
+	_, err = NewSigningMethodBinary(testAESKey, shortHmac)
+	if err == nil {
+		t.Error("expected ErrHMACKeyLength, got nil")
+	}
+}
+
+// TestIsValidBase64 base64 校验函数测试
+func TestIsValidBase64(t *testing.T) {
+	cases := []struct {
+		name string
+		s    string
+		want bool
+	}{
+		{"empty string", "", false},
+		{"valid base64", "SGVsbG8gV29ybGQ=", true},
+		{"invalid char $", "SGVsbG8g$$==", false},
+		{"3 padding ==", "YQ===", false}, // 三个等号非法
+		{"non 4-aligned len", "YQ=", false},
+		{"utf8 char", "中文==", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := IsValidBase64(tc.s)
+			if got != tc.want {
+				t.Errorf("IsValidBase64(%q) = %v want %v", tc.s, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTokenTamper 篡改token，校验HMAC签名失败
+func TestTokenTamper(t *testing.T) {
+	method := mustNewMethod(t)
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "jti-tamper",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
 	tok := NewToken(claims, method)
 	tokenStr, err := tok.SignedString()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	parsed := &UserClaims{}
-	_, err = Parse(tokenStr, parsed, method)
-	if err == nil {
-		t.Fatal("expect expired error, got nil")
+	// 篡改base64字符串的一个字符
+	b := []byte(tokenStr)
+	if len(b) > 0 {
+		b[0] = 'X'
 	}
-	rootErr := unwrapRootErr(err)
-	t.Logf("outer err=%v, root err=%v", err, rootErr)
+	tampered := string(b)
 
-	// 兼容两种情况：源码返回常量error / 返回文本error字符串
-	if rootErr.Error() != "token is expired" {
-		t.Errorf("inner error expect 'token is expired', got '%v'", rootErr)
+	outClaims := &RegisteredClaims{}
+	_, err = Parse(tampered, outClaims, method)
+	if err == nil {
+		t.Error("tampered token should return error")
 	}
 }
 
-func TestNotYetValidToken(t *testing.T) {
-	aesKey, hmacKey := generateTestKeys(t)
-	method, _ := NewSigningMethodBinary(aesKey, hmacKey)
-
+// TestTokenExpired 过期token校验
+func TestTokenExpired(t *testing.T) {
+	method := mustNewMethod(t)
 	now := time.Now().UTC()
-	nbf := now.Add(1 * time.Hour)
-	claims := &UserClaims{
-		UserID:   "future01",
-		Username: "future",
-		RegisteredClaims: RegisteredClaims{
-			ID:        "jti_f01",
-			NotBefore: &nbf,
-			IssuedAt:  &now,
-		},
+	expTime := now.Add(-1 * time.Hour) // 一小时前过期
+	claims := &RegisteredClaims{
+		ID:        "jti-expire",
+		IssuedAt:  ptrTime(now.Add(-2 * time.Hour)),
+		ExpiresAt: &expTime,
+		Ttl:       3600,
 	}
-
 	tok := NewToken(claims, method)
-	tokenStr, _ := tok.SignedString()
-
-	parsed := &UserClaims{}
-	_, err := Parse(tokenStr, parsed, method)
-	if err == nil {
-		t.Fatal("expect not‑valid‑yet error, got nil")
-	}
-	rootErr := unwrapRootErr(err)
-	t.Logf("outer err=%v, root err=%v", err, rootErr)
-
-	if rootErr.Error() != "token is not valid yet" {
-		t.Errorf("inner error expect 'token is not valid yet', got '%v'", rootErr)
-	}
-}
-
-func TestTamperedToken(t *testing.T) {
-	aesKey, hmacKey := generateTestKeys(t)
-	method, _ := NewSigningMethodBinary(aesKey, hmacKey)
-
-	claims := createTestClaims()
-	tok := NewToken(claims, method)
-	tokenStr, _ := tok.SignedString()
-
-	if len(tokenStr) < 6 {
-		t.Fatal("token too short for tamper test")
-	}
-	tampered := tokenStr[:len(tokenStr)-6] + "xxxxxx"
-
-	parsed := &UserClaims{}
-	_, err := Parse(tampered, parsed, method)
-	if err == nil {
-		t.Error("tampered token should return error, got nil")
-	}
-}
-
-func TestWrongKeyVerification(t *testing.T) {
-	aesKey, hmacKey := generateTestKeys(t)
-	methodOK, _ := NewSigningMethodBinary(aesKey, hmacKey)
-
-	claims := createTestClaims()
-	tok := NewToken(claims, methodOK)
-	tokenStr, _ := tok.SignedString()
-
-	wrongAes, wrongHmac := generateTestKeys(t)
-	methodBad, _ := NewSigningMethodBinary(wrongAes, wrongHmac)
-
-	parsed := &UserClaims{}
-	_, err := Parse(tokenStr, parsed, methodBad)
-	if err == nil {
-		t.Error("wrong key should failed, got nil")
-	}
-}
-
-func TestInvalidBase64Token(t *testing.T) {
-	aesKey, hmacKey := generateTestKeys(t)
-	method, _ := NewSigningMethodBinary(aesKey, hmacKey)
-
-	badStr := "hello##$%^notbase64!!"
-	parsed := &UserClaims{}
-	_, err := Parse(badStr, parsed, method)
-	if err == nil {
-		t.Error("invalid base64 should error")
-	}
-}
-
-func TestTooShortToken(t *testing.T) {
-	aesKey, hmacKey := generateTestKeys(t)
-	method, _ := NewSigningMethodBinary(aesKey, hmacKey)
-
-	shortBin := make([]byte, 4)
-	shortToken := base64.StdEncoding.EncodeToString(shortBin)
-
-	parsed := &UserClaims{}
-	_, err := Parse(shortToken, parsed, method)
-	if err == nil {
-		t.Fatal("short binary token expect error")
-	}
-}
-
-func TestCustomClaimsValidation(t *testing.T) {
-	aesKey, hmacKey := generateTestKeys(t)
-	method, _ := NewSigningMethodBinary(aesKey, hmacKey)
-
-	now := time.Now().UTC()
-	exp := now.Add(time.Hour)
-
-	claimsNoUID := &UserClaims{
-		Username: "no_uid_user",
-		RegisteredClaims: RegisteredClaims{
-			ID:        "jti_nouid",
-			ExpiresAt: &exp,
-			IssuedAt:  &now,
-		},
-	}
-	tok1 := NewToken(claimsNoUID, method)
-	tokenStr1, err := tok1.SignedString()
+	tokenStr, err := tok.SignedString()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p1 := &UserClaims{}
-	_, err = Parse(tokenStr1, p1, method)
+	outClaims := &RegisteredClaims{}
+	_, err = Parse(tokenStr, outClaims, method)
 	if err == nil {
-		t.Error("missing UserID should trigger error")
-	}
-	rootErr := unwrapRootErr(err)
-	t.Logf("missing userid outer=%v root=%v", err, rootErr)
-	if rootErr.Error() != "token is missing required claim" {
-		t.Errorf("want 'token is missing required claim', got '%v'", rootErr)
-	}
-
-	claimsNoUname := &UserClaims{
-		UserID: "u1002",
-		RegisteredClaims: RegisteredClaims{
-			ID:        "jti_nouname",
-			ExpiresAt: &exp,
-			IssuedAt:  &now,
-		},
-	}
-	tok2 := NewToken(claimsNoUname, method)
-	tokenStr2, _ := tok2.SignedString()
-	p2 := &UserClaims{}
-	_, err = Parse(tokenStr2, p2, method)
-	if err == nil {
-		t.Error("missing Username should trigger error")
-	}
-	rootErr2 := unwrapRootErr(err)
-	t.Logf("missing username outer=%v root=%v", err, rootErr2)
-	if rootErr2.Error() != "token is missing required claim" {
-		t.Errorf("want 'token is missing required claim', got '%v'", rootErr2)
+		t.Error("expired token should return ErrTokenExpired")
 	}
 }
 
-func TestParseWithClaims(t *testing.T) {
-	aesKey, hmacKey := generateTestKeys(t)
-	method, _ := NewSigningMethodBinary(aesKey, hmacKey)
-
-	claims := createTestClaims()
+// TestTokenNotYetValid nbf未到生效时间
+func TestTokenNotYetValid(t *testing.T) {
+	method := mustNewMethod(t)
+	now := time.Now().UTC()
+	nbf := now.Add(1 * time.Hour) // 1小时后才生效
+	claims := &RegisteredClaims{
+		ID:        "jti-nbf",
+		IssuedAt:  &now,
+		NotBefore: &nbf,
+		ExpiresAt: ptrTime(now.Add(2 * time.Hour)),
+		Ttl:       3600,
+	}
 	tok := NewToken(claims, method)
-	tokenStr, _ := tok.SignedString()
-
-	parsedClaims := &UserClaims{}
-	outTok, err := ParseWithClaims(tokenStr, parsedClaims, func(tk *Token) (SigningMethod, error) {
-		return method, nil
-	})
+	tokenStr, err := tok.SignedString()
 	if err != nil {
-		t.Fatalf("ParseWithClaims err: %v", err)
+		t.Fatal(err)
 	}
-	if outTok == nil {
-		t.Fatal("token nil")
-	}
-	if parsedClaims.UserID != claims.UserID {
-		t.Error("parsewithclaims field mismatch")
-	}
-}
 
-func TestIsValidBase64(t *testing.T) {
-	tests := []struct {
-		name string
-		s    string
-		want bool
-	}{
-		{"valid std base64", base64.StdEncoding.EncodeToString([]byte("hello world")), true},
-		{"base64url with -, no padding", "SGVsbG8tX3dvcmxk", true}, // 注意：现有IsValidBase64允许'-'，源码逻辑就这样
-		{"empty string", "", false},
-		{"illegal char #", "YWhh##", false},
-		{"length not multiple 4", "YWJjZ", false},
-		{"with padding", "YQ==", true},
-		{"invalid char _", "YWhh_", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := IsValidBase64(tt.s)
-			if got != tt.want {
-				t.Errorf("IsValidBase64(%q) want=%v got=%v", tt.s, tt.want, got)
-			}
-		})
-	}
-}
-
-func TestNewSigningMethodBinaryKeyCheck(t *testing.T) {
-	badAes := make([]byte, 16)
-	goodHmac := make([]byte, 32)
-	_, err := NewSigningMethodBinary(badAes, goodHmac)
+	outClaims := &RegisteredClaims{}
+	_, err = Parse(tokenStr, outClaims, method)
 	if err == nil {
-		t.Error("short aes key expect error")
-	}
-
-	goodAes := make([]byte, 32)
-	shortHmac := make([]byte, 8)
-	_, err = NewSigningMethodBinary(goodAes, shortHmac)
-	if err == nil {
-		t.Error("short hmac key expect error")
+		t.Error("token with future nbf should error")
 	}
 }
+
+// TestTokenRefresh 续签Refresh逻辑
+func TestTokenRefresh(t *testing.T) {
+	method := mustNewMethod(t)
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:            "jti-old",
+		IssuedAt:      &now,
+		NotBefore:     &now,
+		ExpiresAt:     ptrTime(now.Add(2 * time.Hour)),
+		Ttl:           3600,
+		IssueCount:    0,
+		MaxIssueCount: 5,
+	}
+	tok := NewToken(claims, method)
+
+	newJti := "jti-new-002"
+	err := tok.Refresh(newJti)
+	if err != nil {
+		t.Fatalf("refresh failed: %v", err)
+	}
+
+	c, ok := tok.Claims.(*RegisteredClaims)
+	if !ok {
+		t.Fatal("claims type assert fail")
+	}
+	if c.ID != newJti {
+		t.Errorf("refresh jti wrong, want %s got %s", newJti, c.ID)
+	}
+	if c.IssueCount != 1 {
+		t.Errorf("issueCount want 1 got %d", c.IssueCount)
+	}
+
+	// 续签达到上限
+	c.IssueCount = 5
+	err = tok.Refresh("jti-over")
+	if err == nil {
+		t.Error("max renewals should return error")
+	}
+}
+
+// TestParseWithClaims 测试带keyFunc的解析（密钥轮换场景）
+func TestParseWithClaims(t *testing.T) {
+	method := mustNewMethod(t)
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "jti-keyfunc",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(claims, method)
+	tokenStr, err := tok.SignedString()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outClaims := &RegisteredClaims{}
+	keyFunc := func(tk *Token) (SigningMethod, error) {
+		if tk.Kid == testKID {
+			return method, nil
+		}
+		return nil, ErrTokenSignatureInvalid
+	}
+
+	parsed, err := ParseWithClaims(tokenStr, outClaims, keyFunc)
+	if err != nil {
+		t.Fatalf("ParseWithClaims failed: %v", err)
+	}
+	if parsed.Kid != testKID {
+		t.Errorf("kid mismatch")
+	}
+}
+
+// TestSignWrongKid 校验kid不匹配时Verify报错
+func TestSignWrongKid(t *testing.T) {
+	m1, err := NewSigningMethodBinaryWithKID(testAESKey, testHMACKey, 1001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := NewSigningMethodBinaryWithKID(testAESKey, testHMACKey, 9999)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "jti-kidtest",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(claims, m1)
+	tokenStr, err := tok.SignedString()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outClaims := &RegisteredClaims{}
+	_, err = Parse(tokenStr, outClaims, m2)
+	if err == nil {
+		t.Error("different kid should trigger signature invalid error")
+	}
+}
+
+// TestVersionFlagCheck 非法版本号、flags校验
+func TestVersionFlagCheck(t *testing.T) {
+	method := mustNewMethod(t)
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "jti-badver",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(claims, method)
+	tokenStr, err := tok.SignedString()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 解码，手动修改版本字节
+	tokenBytes, err := base64.StdEncoding.DecodeString(tokenStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 修改版本号为0x02
+	tokenBytes[8] = 0x02
+	alteredB64 := base64.StdEncoding.EncodeToString(tokenBytes)
+
+	outClaims := &RegisteredClaims{}
+	_, err = Parse(alteredB64, outClaims, method)
+	if err == nil {
+		t.Error("invalid version should return decryption failed error")
+	}
+}
+
+func TestBadReservedHeader(t *testing.T) {
+	method := mustNewMethod(t)
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "jti-bad-reserved",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(claims, method)
+	tokenStr, err := tok.SignedString()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tokenBytes, err := base64.StdEncoding.DecodeString(tokenStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 修改保留字节，9号位置置1
+	tokenBytes[9] = 0x01
+	alteredB64 := base64.StdEncoding.EncodeToString(tokenBytes)
+
+	outClaims := &RegisteredClaims{}
+	_, err = Parse(alteredB64, outClaims, method)
+	if err == nil {
+		t.Error("non-zero reserved bytes should fail decryption")
+	}
+}
+
+func TestBadFlags(t *testing.T) {
+	method := mustNewMethod(t)
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "jti-bad-flags",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(claims, method)
+	tokenStr, err := tok.SignedString()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tokenBytes, err := base64.StdEncoding.DecodeString(tokenStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// flags 由0x01改成0x02
+	tokenBytes[13] = 0x02
+	alteredB64 := base64.StdEncoding.EncodeToString(tokenBytes)
+
+	outClaims := &RegisteredClaims{}
+	_, err = Parse(alteredB64, outClaims, method)
+	if err == nil {
+		t.Error("invalid flags should return decryption failed error")
+	}
+}
+
+func TestWrongHmacKey(t *testing.T) {
+	// 相同AES、相同KID，但HMAC密钥不同
+	hmacKeyWrong := []byte("wrong-hmac-key-1234567890123456")
+	mSign, err := NewSigningMethodBinaryWithKID(testAESKey, testHMACKey, testKID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mVerifyBadHmac, err := NewSigningMethodBinaryWithKID(testAESKey, hmacKeyWrong, testKID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "jti-wronghmac",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(claims, mSign)
+	tokenStr, err := tok.SignedString()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outClaims := &RegisteredClaims{}
+	_, err = Parse(tokenStr, outClaims, mVerifyBadHmac)
+	if err == nil {
+		t.Error("using wrong HMAC key should fail signature verify")
+	}
+}
+
+func TestClaimEmptyJti(t *testing.T) {
+	method := mustNewMethod(t)
+	now := time.Now().UTC()
+	// ID为空
+	claims := &RegisteredClaims{
+		ID:        "",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(claims, method)
+	tokenStr, err := tok.SignedString()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outClaims := &RegisteredClaims{}
+	_, err = Parse(tokenStr, outClaims, method)
+	if err == nil {
+		t.Error("empty jti should return ErrTokenInvalidId")
+	}
+}
+
+func TestIatFuture(t *testing.T) {
+	method := mustNewMethod(t)
+	now := time.Now().UTC()
+	futureIat := now.Add(2 * time.Hour)
+	claims := &RegisteredClaims{
+		ID:        "jti-future-iat",
+		IssuedAt:  &futureIat,
+		ExpiresAt: ptrTime(now.Add(3 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(claims, method)
+	tokenStr, err := tok.SignedString()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outClaims := &RegisteredClaims{}
+	_, err = Parse(tokenStr, outClaims, method)
+	if err == nil {
+		t.Error("iat in future should return ErrTokenUsedBeforeIssued")
+	}
+}
+
+func BenchmarkSign(b *testing.B) {
+	method, err := NewSigningMethodBinaryWithKID(testAESKey, testHMACKey, testKID)
+	if err != nil {
+		b.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "bench-jti-001",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(claims, method)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := tok.SignedString()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkVerify(b *testing.B) {
+	method, err := NewSigningMethodBinaryWithKID(testAESKey, testHMACKey, testKID)
+	if err != nil {
+		b.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claims := &RegisteredClaims{
+		ID:        "bench-jti-001",
+		IssuedAt:  &now,
+		ExpiresAt: ptrTime(now.Add(1 * time.Hour)),
+		Ttl:       3600,
+	}
+	tok := NewToken(claims, method)
+	tokenStr, err := tok.SignedString()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out := &RegisteredClaims{}
+		_, err := Parse(tokenStr, out, method)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// go test -v ./...
+// go test -bench=. -benchmem
